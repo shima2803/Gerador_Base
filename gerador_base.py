@@ -422,6 +422,7 @@ WHERE t.cod_cli IN ({cod_cli});
 # =========================
 # Nunca Contatados
 # =========================
+
 SQL_NUNCA = r"""
 WITH
 cpc_ultimo AS (
@@ -433,7 +434,7 @@ cpc_ultimo AS (
     JOIN stcob_tb st ON st.st = his.ocorr
     WHERE cad.cod_cli IN ({cod_cli})
       AND cad.stcli <> 'INA'
-      AND st.bsc LIKE '%CPC%'
+      AND st.bsc LIKE '%%CPC%%'
     GROUP BY cad.nmcont
 ),
 acordos_ranked AS (
@@ -490,7 +491,7 @@ valores AS (
         ON rec.nmcont = recc.nmcont
        AND rec.cod_cli = recc.cod_cli
     WHERE recc.cod_cli IN ({cod_cli})
-      AND rec.fat_parc NOT LIKE '%ENTRADA%'
+      AND rec.fat_parc NOT LIKE '%%ENTRADA%%'
       AND recc.nmcont NOT IN (SELECT nmcont FROM acordos_pagos)
     GROUP BY recc.nmcont, recc.cod_cli
 ),
@@ -535,15 +536,15 @@ telefones AS (
             LEFT JOIN stcob_tb s ON s.st = h.ocorr
             WHERE h.cod_cli = cad.cod_cad
               AND h.data_at >= CURDATE() - INTERVAL 30 DAY
-              AND (s.bsc NOT LIKE '%sistema%' OR s.bsc NOT LIKE '' OR s.bsc IS NOT NULL)
+              AND (s.bsc NOT LIKE '%%sistema%%' OR s.bsc NOT LIKE '' OR s.bsc IS NOT NULL)
               AND h.cod_usu <> '999'
             GROUP BY h.cod_cli
       )
       AND (tel.status IN (2, 4, 5, 6, 1)
-           OR (tel.obs NOT LIKE '%Descon%' AND tel.obs NOT LIKE '%incorret%'))
+           OR (tel.obs NOT LIKE '%%Descon%%' AND tel.obs NOT LIKE '%%incorret%%'))
       AND cad.stcli <> 'INA'
       AND LENGTH(CONCAT(dddfone, telefone)) >= 8
-      AND CONCAT(dddfone, telefone) NOT LIKE '%X%'
+      AND CONCAT(dddfone, telefone) NOT LIKE '%%X%%'
     GROUP BY cad.cod_cad, cad.nomecli, cad.cpfcnpj, cad.nmcont, cad.cod_cli,
              nascto, cad.infoad, dddfone, telefone, tel.status
 ),
@@ -593,7 +594,6 @@ LEFT JOIN cpc_ultimo cpc
     ON t.nmcont = cpc.nmcont
 WHERE t.cod_cli IN ({cod_cli});
 """
-
 
 # =========================
 # Quebras Rejeitadas
@@ -811,13 +811,7 @@ def build_sql_and_params(sql_template: str, carteiras: list[int], extra: dict | 
     extra = extra or {}
     in_placeholders = ", ".join(["%s"] * len(carteiras))
 
-    occurrences = sql_template.count("{cod_cli}")
-    if occurrences < 1:
-        occurrences = 1
-
-    params = carteiras * occurrences
-
-    # Alguns SQLs antigos usam placeholders opcionais
+    # Monta o SQL final
     sql = sql_template.format(
         cod_cli=in_placeholders,
         tel_limit=TEL_LIMIT_FIXO,
@@ -827,8 +821,19 @@ def build_sql_and_params(sql_template: str, carteiras: list[int], extra: dict | 
         vlrparc_having=extra.get("vlrparc_having", ""),
     )
 
-    if extra.get("_date_params"):
-        params += extra["_date_params"]
+    date_params = extra.get("_date_params", []) or []
+
+    # Conta quantos %s existem no SQL FINAL
+    total_placeholders = sql.count("%s")
+
+    # Quantos %s sobram para carteiras (tirando os de data)
+    carteira_placeholders = total_placeholders - len(date_params)
+    if carteira_placeholders < 0:
+        raise ValueError("SQL possui menos placeholders do que parâmetros de data.")
+
+    # Preenche parâmetros de carteiras ciclando (garante quantidade exata)
+    params = [carteiras[i % len(carteiras)] for i in range(carteira_placeholders)]
+    params += date_params
 
     return sql, params
 
