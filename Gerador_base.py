@@ -916,6 +916,7 @@ class App(tk.Tk):
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=0)
 
         self._build_header()
         self._build_body()
@@ -988,6 +989,22 @@ class App(tk.Tk):
 
         self._build_sidebar(body)
         self._build_content(body)
+                # -------------------------
+        # Rodapé
+        # -------------------------
+        footer = ttk.Frame(self, style="App.TFrame", padding=(16, 6))
+        footer.grid(row=2, column=0, sticky="ew")
+
+        footer.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            footer,
+            text="© 2026 – Desenvolvido por: Lucas Shimazaki e Natã Rafael DJUR5",
+            font=("Segoe UI", 9),
+            foreground="#6b7585",
+            background="#f6f7fb"
+        ).grid(row=0, column=0, sticky="w")
+
 
     def _build_sidebar(self, parent):
         sidebar = ttk.Frame(parent, style="App.TFrame")
