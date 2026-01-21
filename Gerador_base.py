@@ -7,6 +7,8 @@ from tkinter import ttk, messagebox, filedialog
 import pandas as pd
 import mysql.connector
 
+from openpyxl.utils import get_column_letter
+
 
 # =========================
 # CONFIG / CONSTANTES
@@ -20,6 +22,10 @@ CARTEIRAS = [
 ]
 
 TEL_LIMIT_FIXO = 7
+
+# (Opção 1) Histórico: qual coluna em hist_tb referencia cadastros_tb.cod_cad?
+# No seu SQL original está como "his.cod_cli". Se no seu banco for diferente, ajuste aqui.
+HIST_CAD_REF_COL = "cod_cli"
 
 
 # =========================
@@ -99,11 +105,56 @@ def _parse_money_br_or_plain(s: str) -> float:
     # Se tem vírgula, assume formato BR (1.234,56)
     if "," in raw:
         raw = raw.replace(".", "").replace(",", ".")
-    # Se não tem vírgula, assume ponto como decimal (ou sem decimal)
     try:
         return float(raw)
     except ValueError:
         raise ValueError("Valor mínimo inválido. Ex.: 10000 ou 10.000,00")
+
+
+def _write_excel_pretty(df: pd.DataFrame, path: str, sheet_name: str):
+    """
+    (Opção 10) Excel mais "profissional":
+      - Freeze header
+      - AutoFilter
+      - Ajuste de largura (amostrando até 500 linhas)
+      - Formatação numérica em colunas de valor
+    """
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.sheets[sheet_name]
+
+        # Congela cabeçalho
+        ws.freeze_panes = "A2"
+
+        # Filtro automático
+        ws.auto_filter.ref = ws.dimensions
+
+        # Ajuste de largura (amostra para não ficar pesado)
+        sample_rows = min(len(df), 500)
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            max_len = len(str(col_name)) if col_name is not None else 10
+
+            if sample_rows > 0:
+                series = df[col_name].iloc[:sample_rows]
+                for v in series:
+                    if v is None:
+                        continue
+                    s = str(v)
+                    if len(s) > max_len:
+                        max_len = len(s)
+
+            width = max(10, min(max_len + 2, 60))
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+        # Formatação de colunas de valor (leve e útil)
+        money_keywords = ("valor", "vlr", "divida", "acordo", "parc", "commission", "collected", "goal")
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            col_lower = str(col_name).lower()
+
+            # Se a coluna parece monetária E é numérica, aplica formato #,##0.00
+            if any(k in col_lower for k in money_keywords) and pd.api.types.is_numeric_dtype(df[col_name]):
+                for row in range(2, ws.max_row + 1):
+                    ws.cell(row=row, column=col_idx).number_format = "#,##0.00"
 
 
 # =========================
@@ -111,17 +162,20 @@ def _parse_money_br_or_plain(s: str) -> float:
 # =========================
 def build_sql_and_params(sql_template: str, carteiras: list[int], extra: dict | None = None) -> tuple[str, list]:
     """
-    Monta SQL final e lista de params com:
-      - placeholders de carteiras (IN)
-      - params adicionais no final (datas, valor mínimo etc.)
-
-    Observação: mantém sua lógica de placeholders, só generalizei o "date_params"
-    para "tail_params" (qualquer parâmetro extra no final).
+    (Opção 2) Montagem determinística dos parâmetros:
+      - Para cada ocorrência de {cod_cli} no template, adiciona a lista completa de carteiras
+      - Depois adiciona os parâmetros de cauda (_tail_params)
     """
     if not carteiras:
         raise ValueError("Nenhuma carteira selecionada.")
 
     extra = extra or {}
+
+    # Quantas vezes o template usa {cod_cli}
+    cod_cli_occurrences = sql_template.count("{cod_cli}")
+    if cod_cli_occurrences <= 0:
+        raise ValueError("SQL template não contém {cod_cli}.")
+
     in_placeholders = ", ".join(["%s"] * len(carteiras))
 
     sql = sql_template.format(
@@ -132,23 +186,19 @@ def build_sql_and_params(sql_template: str, carteiras: list[int], extra: dict | 
         infoad_filter=extra.get("infoad_filter", ""),
         vlrparc_having=extra.get("vlrparc_having", ""),
         having_filter=extra.get("having_filter", ""),
+        hist_cad_ref_col=extra.get("hist_cad_ref_col", HIST_CAD_REF_COL),  # (Opção 1)
     )
 
-    # Compatível com seu padrão antigo
     tail_params = extra.get("_tail_params", None)
     if tail_params is None:
         tail_params = extra.get("_date_params", []) or []
     else:
         tail_params = tail_params or []
 
-    total_placeholders = sql.count("%s")
-    carteira_placeholders = total_placeholders - len(tail_params)
-    if carteira_placeholders < 0:
-        raise ValueError("SQL possui menos placeholders do que parâmetros adicionais.")
-
-    # Preenche parâmetros de carteiras ciclando (garante quantidade exata)
-    params = [carteiras[i % len(carteiras)] for i in range(carteira_placeholders)]
-    params += tail_params
+    params: list = []
+    for _ in range(cod_cli_occurrences):
+        params.extend(carteiras)
+    params.extend(tail_params)
 
     return sql, params
 
@@ -258,6 +308,7 @@ WHERE rn = 1
 ORDER BY cod_aco DESC;
 """
 
+# (Opção 1) CPC por período — JOIN parametrizável para ficar claro.
 SQL_CPC_PERIODO = r"""
 SELECT
     cad.cod_cad,
@@ -267,7 +318,7 @@ SELECT
     MAX(his.data_at) AS dt_ultimo_cpc
 FROM cadastros_tb cad
 JOIN hist_tb his
-    ON his.cod_cli = cad.cod_cad
+    ON his.{hist_cad_ref_col} = cad.cod_cad
 JOIN stcob_tb st
     ON st.st = his.ocorr
 WHERE cad.cod_cli IN ({cod_cli})
@@ -848,12 +899,6 @@ GROUP BY cad.cod_cad, cad.nomecli, cad.cpfcnpj, cad.nmcont, cad.cod_cli
 ORDER BY QtdGarantiasUnicas DESC;
 """
 
-
-# =========================
-# NOVA QUERY: Maiores Dívidas (com valor mínimo)
-# - carteira dinâmica (IN {cod_cli})
-# - valor mínimo via HAVING SUM(...) >= %s
-# =========================
 SQL_MAIORES_DIVIDAS = r"""
 SELECT
     cad.cod_cad,
@@ -888,21 +933,19 @@ QUERIES = {
     "Email (nome, CPF/CNPJ, email)": (SQL_EMAIL, "base_email.xlsx", "Email"),
     "Nome + CPF/CNPJ": (SQL_NOME_CPF, "base_nome_cpf.xlsx", "NomeCPF"),
     "Telefones + Melhor Contato (Top 7)": (SQL_TELEFONES_MELHOR_CONTATO, "base_telefones_melhor_contato.xlsx", "TelefonesTop7"),
-    "Acordos (Promessa/Em Acordo)": (SQL_ACORDOS_PA, "base_acordos_PA.xlsx", "AcordosPA"),
+    "Acordos (Promessa/Em Acordo) P/A": (SQL_ACORDOS_PA, "base_acordos_PA.xlsx", "AcordosPA"),
     "CPC por Periodo (datas)": (SQL_CPC_PERIODO, "base_cpc_periodo.xlsx", "CPCPeriodo"),
     "Sem Historico (ultimos 30 dias)": (SQL_SEM_HIST_30D, "base_sem_hist_30d.xlsx", "SemHist30d"),
-    "Garantias": (SQL_GARANTIAS_BENS, "base_garantias_bens.xlsx", "Garantias"),
+    "Garantias (bens_tb)": (SQL_GARANTIAS_BENS, "base_garantias_bens.xlsx", "Garantias"),
     "Quebras Rejeitadas": (SQL_QUEBRAS_REJEITADAS, "base_quebras_rejeitadas.xlsx", "QuebrasRejeitadas"),
     "Nunca Contatados": (SQL_NUNCA, "base_nunca.xlsx", "Nunca"),
     "Base Recentes": (SQL_RECENTES, "base_recentes.xlsx", "Recentes"),
-
-    # NOVA
     "Maiores Dividas (valor minimo)": (SQL_MAIORES_DIVIDAS, "base_maiores_dividas.xlsx", "MaioresDividas"),
 }
 
 
 # =========================
-# UI (sem Status/Log, com parâmetros extras)
+# UI
 # =========================
 class App(tk.Tk):
     def __init__(self):
@@ -923,7 +966,7 @@ class App(tk.Tk):
 
         self._refresh_params_visibility()
         self._set_busy(False)
-    
+
     def _on_query_listbox_change(self, event):
         sel = event.widget.curselection()
         if not sel:
@@ -931,7 +974,6 @@ class App(tk.Tk):
         value = event.widget.get(sel[0])
         self.query_var.set(value)
         self._refresh_params_visibility()
-
 
     # -------------------------
     # Style
@@ -989,12 +1031,10 @@ class App(tk.Tk):
 
         self._build_sidebar(body)
         self._build_content(body)
-                # -------------------------
+
         # Rodapé
-        # -------------------------
         footer = ttk.Frame(self, style="App.TFrame", padding=(16, 6))
         footer.grid(row=2, column=0, sticky="ew")
-
         footer.columnconfigure(0, weight=1)
 
         ttk.Label(
@@ -1004,7 +1044,6 @@ class App(tk.Tk):
             foreground="#6b7585",
             background="#f6f7fb"
         ).grid(row=0, column=0, sticky="w")
-
 
     def _build_sidebar(self, parent):
         sidebar = ttk.Frame(parent, style="App.TFrame")
@@ -1042,17 +1081,14 @@ class App(tk.Tk):
         inner.grid(row=0, column=0, sticky="ew")
         inner.columnconfigure(0, weight=1)
 
-# -------------------------
-# Lista de consultas (SEM SCROLL)
-# -------------------------
+        # Lista de consultas
         self.query_var = tk.StringVar()
 
         self.query_listbox = tk.Listbox(
             inner,
-            height=len(QUERIES),          # mostra todas
+            height=len(QUERIES),
             exportselection=False
         )
-
         for q in QUERIES.keys():
             self.query_listbox.insert(tk.END, q)
 
@@ -1060,12 +1096,12 @@ class App(tk.Tk):
 
         # seleciona a primeira automaticamente
         self.query_listbox.selection_set(0)
+        self.query_listbox.see(0)
         self.query_var.set(self.query_listbox.get(0))
 
         self.query_listbox.bind("<<ListboxSelect>>", self._on_query_listbox_change)
 
-
-        # Parâmetros (dinâmicos)
+        # Parâmetros
         self.lf_params = ttk.LabelFrame(content, text="Parâmetros", style="Card.TLabelframe")
         self.lf_params.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         self.lf_params.columnconfigure(0, weight=1)
@@ -1073,7 +1109,7 @@ class App(tk.Tk):
         params_row = ttk.Frame(self.lf_params, style="CardInner.TFrame")
         params_row.grid(row=0, column=0, sticky="ew")
 
-        # --- CPC por período
+        # CPC por período
         ttk.Label(params_row, text="Data Início (YYYY-MM-DD):").grid(row=0, column=0, sticky="w")
         self.dt_ini_var = tk.StringVar(value="")
         self.dt_ini_entry = ttk.Entry(params_row, textvariable=self.dt_ini_var, width=16)
@@ -1087,7 +1123,7 @@ class App(tk.Tk):
         self.lbl_dt_hint = ttk.Label(params_row, text="(vazio = sem filtro)", style="Hint.TLabel")
         self.lbl_dt_hint.grid(row=0, column=4, sticky="w")
 
-        # --- Maiores Dívidas: valor mínimo
+        # Maiores Dívidas: valor mínimo
         ttk.Label(params_row, text="Valor mínimo da dívida:").grid(row=1, column=0, sticky="w", pady=(10, 0))
         self.min_div_var = tk.StringVar(value="")
         self.min_div_entry = ttk.Entry(params_row, textvariable=self.min_div_var, width=16)
@@ -1142,29 +1178,27 @@ class App(tk.Tk):
         is_cpc = (q == "CPC por Periodo (datas)")
         is_maiores = (q == "Maiores Dividas (valor minimo)")
 
-        # Campos de data (CPC)
         self.dt_ini_entry.configure(state=("normal" if is_cpc else "disabled"))
         self.dt_fim_entry.configure(state=("normal" if is_cpc else "disabled"))
-
-        # Campo valor mínimo (Maiores Dívidas)
         self.min_div_entry.configure(state=("normal" if is_maiores else "disabled"))
-
-        # Dica visual: se nenhum parâmetro necessário, você pode deixar o frame ativo mesmo
-        # (aqui mantemos sempre, só desabilitando campos)
-
-    def _on_query_change(self, _evt=None):
-        self._refresh_params_visibility()
 
     # -------------------------
     # Actions
     # -------------------------
     def limpar(self):
+        # (Opção 7) reset visual também no Listbox
         for var, _ in self.carteira_vars:
             var.set(False)
-        self.query_var.set(list(QUERIES.keys())[0])
+
         self.dt_ini_var.set("")
         self.dt_fim_var.set("")
         self.min_div_var.set("")
+
+        self.query_listbox.selection_clear(0, tk.END)
+        self.query_listbox.selection_set(0)
+        self.query_listbox.see(0)
+        self.query_var.set(self.query_listbox.get(0))
+
         self._refresh_params_visibility()
 
     def _build_extra_for_selected_query(self, query_name: str) -> dict:
@@ -1173,7 +1207,7 @@ class App(tk.Tk):
             dt_ini = self.dt_ini_var.get().strip()
             dt_fim = self.dt_fim_var.get().strip()
 
-            extra = {"_tail_params": []}
+            extra = {"_tail_params": [], "hist_cad_ref_col": HIST_CAD_REF_COL}
 
             if dt_ini:
                 if not _is_valid_ymd(dt_ini):
@@ -1193,7 +1227,7 @@ class App(tk.Tk):
 
             return extra
 
-        # Maiores Dívidas com valor mínimo (HAVING)
+        # Maiores Dívidas
         if query_name == "Maiores Dividas (valor minimo)":
             min_txt = self.min_div_var.get().strip()
             min_value = _parse_money_br_or_plain(min_txt)
@@ -1201,10 +1235,8 @@ class App(tk.Tk):
             extra = {"_tail_params": []}
             extra["having_filter"] = "HAVING SUM(rec.vlrparc) >= %s"
             extra["_tail_params"].append(min_value)
-
             return extra
 
-        # Demais queries sem parâmetros
         return {}
 
     def gerar_excel(self):
@@ -1244,8 +1276,8 @@ class App(tk.Tk):
         try:
             df = run_query(sql_template, carteiras, extra=extra)
 
-            with pd.ExcelWriter(path, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False, sheet_name=sheet_name)
+            # (Opção 10) Excel bonitinho
+            _write_excel_pretty(df, path, sheet_name)
 
             self.after(0, self._on_job_success, path, len(df))
 
