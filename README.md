@@ -91,6 +91,4 @@ O aviso do Pandas (pandas only supports SQLAlchemy...) é apenas warning e não 
 Caso você tenha alguma dúvida, ou não ache a base que você precisa, entre em contato com:
 juridico577@oliveiraeantunes.com.br
 
-📩 Suporte
-Caso você tenha alguma dúvida, ou não ache a base que você precisa, entre em contato com:
-juridico577@oliveiraeantunes.com.br
+ps: isso é um beta teste, porem caso não tenha nenhum erro, será a versao final
